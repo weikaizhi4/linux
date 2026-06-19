@@ -105,7 +105,7 @@
 	status = "okay";
 
 	touchscreen@1c {
-		compatible = "cypress,tt21000";
+		compatible = "huawei,scale-cyttsp5", "cypress,tt21000";
 		reg = <0x1c>;
 
 		interrupt-parent = <&tlmm>;
