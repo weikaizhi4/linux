@@ -20,6 +20,7 @@
 #include <linux/i2c.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/unaligned.h>
 
@@ -193,6 +194,26 @@ struct cyttsp5_hid_desc {
 	u8 reserved[4];
 } __packed;
 
+struct cyttsp5_quirks {
+	bool raw_i2c_read;
+	bool descriptor_first;
+	bool launch_app_reset_expected;
+	bool scale_reset_sequence;
+	unsigned int launch_app_timeout_ms;
+};
+
+static const struct cyttsp5_quirks cyttsp5_default_quirks = {
+	.launch_app_timeout_ms = CY_HID_OUTPUT_TIMEOUT_MS,
+};
+
+static const struct cyttsp5_quirks cyttsp5_scale_quirks = {
+	.raw_i2c_read = true,
+	.descriptor_first = true,
+	.launch_app_reset_expected = true,
+	.scale_reset_sequence = true,
+	.launch_app_timeout_ms = 2000,
+};
+
 struct cyttsp5 {
 	struct device *dev;
 	struct completion cmd_done;
@@ -208,6 +229,7 @@ struct cyttsp5 {
 	struct regmap *regmap;
 	struct touchscreen_properties prop;
 	struct regulator_bulk_data supplies[2];
+	const struct cyttsp5_quirks *quirks;
 };
 
 /*
@@ -221,11 +243,26 @@ static int cyttsp5_read(struct cyttsp5 *ts, u8 *buf, u32 max)
 	int error;
 	u32 size;
 	u8 temp[2];
+	struct i2c_client *client = to_i2c_client(ts->dev);
+
+	if (max < sizeof(temp))
+		return -EINVAL;
 
 	/* Read the frame to retrieve the size */
-	error = regmap_bulk_read(ts->regmap, HID_INPUT_REG, temp, sizeof(temp));
-	if (error)
-		return error;
+	if (ts->quirks->raw_i2c_read) {
+		error = i2c_master_recv(client, temp, sizeof(temp));
+		if (error < 0)
+			return error;
+		if (error != sizeof(temp))
+			return -EIO;
+	} else {
+		error = regmap_bulk_read(ts->regmap, HID_INPUT_REG, temp,
+					 sizeof(temp));
+		if (error)
+			return error;
+	}
+
+	memcpy(buf, temp, sizeof(temp));
 
 	size = get_unaligned_le16(temp);
 	if (!size || size == 2)
@@ -235,7 +272,19 @@ static int cyttsp5_read(struct cyttsp5 *ts, u8 *buf, u32 max)
 		return -EINVAL;
 
 	/* Get the real value */
-	return regmap_bulk_read(ts->regmap, HID_INPUT_REG, buf, size);
+	if (ts->quirks->raw_i2c_read) {
+		error = i2c_master_recv(client, buf, size);
+		if (error < 0)
+			return error;
+		if (error != size)
+			return -EIO;
+	} else {
+		error = regmap_bulk_read(ts->regmap, HID_INPUT_REG, buf, size);
+		if (error)
+			return error;
+	}
+
+	return 0;
 }
 
 static int cyttsp5_write(struct cyttsp5 *ts, unsigned int reg, u8 *data,
@@ -393,6 +442,8 @@ static int cyttsp5_setup_input_device(struct device *dev)
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, MAX_AREA, 0, 0);
 	input_set_abs_params(ts->input, ABS_MT_TOUCH_MINOR, 0, MAX_AREA, 0, 0);
 
+	touchscreen_parse_properties(ts->input, true, &ts->prop);
+
 	error = input_mt_init_slots(ts->input, si->tch_abs[CY_TCH_T].max,
 				    INPUT_MT_DROP_UNUSED | INPUT_MT_DIRECT);
 	if (error)
@@ -549,6 +600,8 @@ static int cyttsp5_hid_output_get_sysinfo(struct cyttsp5 *ts)
 	cmd[3] = 0x0; /* Reserved */
 	cmd[4] = HID_OUTPUT_GET_SYSINFO;
 
+	reinit_completion(&ts->cmd_done);
+
 	rc = cyttsp5_write(ts, HID_OUTPUT_REG, cmd,
 			   HID_OUTPUT_GET_SYSINFO_SIZE);
 	if (rc) {
@@ -582,6 +635,8 @@ static int cyttsp5_power_control(struct cyttsp5 *ts, bool on)
 	SET_CMD_REPORT_TYPE(cmd[0], 0);
 	SET_CMD_REPORT_ID(cmd[0], state);
 	SET_CMD_OPCODE(cmd[1], HID_CMD_SET_POWER);
+
+	reinit_completion(&ts->cmd_done);
 
 	rc = cyttsp5_write(ts, HID_COMMAND_REG, cmd, sizeof(cmd));
 	if (rc) {
@@ -623,6 +678,8 @@ static int cyttsp5_hid_output_bl_launch_app(struct cyttsp5 *ts)
 	put_unaligned_le16(crc, &cmd[8]);
 	cmd[10] = HID_OUTPUT_BL_EOP;
 
+	reinit_completion(&ts->cmd_done);
+
 	rc = cyttsp5_write(ts, HID_OUTPUT_REG, cmd,
 			   HID_OUTPUT_BL_LAUNCH_APP_SIZE);
 	if (rc) {
@@ -631,11 +688,23 @@ static int cyttsp5_hid_output_bl_launch_app(struct cyttsp5 *ts)
 	}
 
 	rc = wait_for_completion_interruptible_timeout(&ts->cmd_done,
-				msecs_to_jiffies(CY_HID_OUTPUT_TIMEOUT_MS));
+			msecs_to_jiffies(ts->quirks->launch_app_timeout_ms));
 	if (rc <= 0) {
+		if (ts->quirks->launch_app_reset_expected) {
+			dev_warn(ts->dev,
+				 "HID launch app response timed out, assuming reset\n");
+			msleep(100);
+			return 0;
+		}
+
 		dev_err(ts->dev, "HID output cmd execution timed out\n");
-		rc = -ETIMEDOUT;
-		return rc;
+		return -ETIMEDOUT;
+	}
+
+	if (ts->quirks->launch_app_reset_expected &&
+	    !get_unaligned_le16(&ts->response_buf[0])) {
+		msleep(100);
+		return 0;
 	}
 
 	rc = cyttsp5_validate_cmd_response(ts, HID_OUTPUT_BL_LAUNCH_APP);
@@ -652,6 +721,8 @@ static int cyttsp5_get_hid_descriptor(struct cyttsp5 *ts,
 {
 	struct device *dev = ts->dev;
 	int rc;
+
+	reinit_completion(&ts->cmd_done);
 
 	rc = cyttsp5_write(ts, HID_DESC_REG, NULL, 0);
 	if (rc) {
@@ -738,10 +809,20 @@ static int cyttsp5_deassert_int(struct cyttsp5 *ts)
 	u16 size;
 	u8 buf[2];
 	int error;
+	struct i2c_client *client = to_i2c_client(ts->dev);
 
-	error = regmap_bulk_read(ts->regmap, HID_INPUT_REG, buf, sizeof(buf));
-	if (error < 0)
-		return error;
+	if (ts->quirks->raw_i2c_read) {
+		error = i2c_master_recv(client, buf, sizeof(buf));
+		if (error < 0)
+			return error;
+		if (error != sizeof(buf))
+			return -EIO;
+	} else {
+		error = regmap_bulk_read(ts->regmap, HID_INPUT_REG, buf,
+					 sizeof(buf));
+		if (error)
+			return error;
+	}
 
 	size = get_unaligned_le16(&buf[0]);
 	if (size == 2 || size == 0)
@@ -772,25 +853,9 @@ static int cyttsp5_fill_all_touch(struct cyttsp5 *ts)
 	return 0;
 }
 
-static int cyttsp5_startup(struct cyttsp5 *ts)
+static int cyttsp5_start_app(struct cyttsp5 *ts)
 {
 	int error;
-
-	error = cyttsp5_deassert_int(ts);
-	if (error) {
-		dev_err(ts->dev, "Error on deassert int r=%d\n", error);
-		return -ENODEV;
-	}
-
-	/*
-	 * Launch the application as the device starts in bootloader mode
-	 * because of a power-on-reset
-	 */
-	error = cyttsp5_hid_output_bl_launch_app(ts);
-	if (error < 0) {
-		dev_err(ts->dev, "Error on launch app r=%d\n", error);
-		return error;
-	}
 
 	error = cyttsp5_get_hid_descriptor(ts, &ts->hid_desc);
 	if (error < 0) {
@@ -809,6 +874,55 @@ static int cyttsp5_startup(struct cyttsp5 *ts)
 		dev_err(ts->dev, "Error on getting sysinfo r=%d\n", error);
 		return error;
 	}
+
+	return 0;
+}
+
+static int cyttsp5_startup(struct cyttsp5 *ts)
+{
+	int error;
+
+	error = cyttsp5_deassert_int(ts);
+	if (error) {
+		dev_err(ts->dev, "Error on deassert int r=%d\n", error);
+		return -ENODEV;
+	}
+
+	if (!ts->quirks->descriptor_first) {
+		/*
+		 * Launch the application as the device starts in bootloader mode
+		 * because of a power-on-reset.
+		 */
+		error = cyttsp5_hid_output_bl_launch_app(ts);
+		if (error < 0) {
+			dev_err(ts->dev, "Error on launch app r=%d\n", error);
+			return error;
+		}
+
+		return cyttsp5_start_app(ts);
+	}
+
+	error = cyttsp5_start_app(ts);
+	if (!error) {
+		dev_info(ts->dev, "Started from application mode\n");
+		return 0;
+	}
+
+	dev_warn(ts->dev,
+		 "Initial app startup failed r=%d, trying bootloader launch\n",
+		 error);
+
+	error = cyttsp5_hid_output_bl_launch_app(ts);
+	if (error < 0) {
+		dev_err(ts->dev, "Error on launch app r=%d\n", error);
+		return error;
+	}
+
+	error = cyttsp5_start_app(ts);
+	if (error)
+		return error;
+
+	dev_info(ts->dev, "Started after bootloader launch\n");
 
 	return error;
 }
@@ -834,6 +948,9 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 	/* Initialize device info */
 	ts->regmap = regmap;
 	ts->dev = dev;
+	ts->quirks = device_get_match_data(dev);
+	if (!ts->quirks)
+		ts->quirks = &cyttsp5_default_quirks;
 	si = &ts->sysinfo;
 	dev_set_drvdata(dev, ts);
 
@@ -878,12 +995,22 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 		return error;
 	}
 
-	fsleep(10); /* Ensure long-enough reset pulse (minimum 10us). */
+	if (ts->quirks->scale_reset_sequence) {
+		gpiod_set_value_cansleep(ts->reset_gpio, 0);
+		msleep(20);
+		gpiod_set_value_cansleep(ts->reset_gpio, 1);
+		msleep(40);
+	} else {
+		fsleep(10); /* Ensure long-enough reset pulse (minimum 10us). */
+	}
 
 	gpiod_set_value_cansleep(ts->reset_gpio, 0);
 
 	/* Need a delay to have device up */
-	msleep(20);
+	if (ts->quirks->scale_reset_sequence)
+		msleep(100);
+	else
+		msleep(20);
 
 	error = devm_request_threaded_irq(dev, irq, NULL, cyttsp5_handle_irq,
 					  IRQF_ONESHOT, name, ts);
@@ -903,8 +1030,6 @@ static int cyttsp5_probe(struct device *dev, struct regmap *regmap, int irq,
 		dev_err(ts->dev, "Error while parsing dts %d\n", error);
 		return error;
 	}
-
-	touchscreen_parse_properties(ts->input, true, &ts->prop);
 
 	__set_bit(EV_KEY, ts->input->evbit);
 	for (i = 0; i < si->num_btns; i++)
@@ -932,7 +1057,8 @@ static int cyttsp5_i2c_probe(struct i2c_client *client)
 }
 
 static const struct of_device_id cyttsp5_of_match[] = {
-	{ .compatible = "cypress,tt21000", },
+	{ .compatible = "huawei,scale-cyttsp5", .data = &cyttsp5_scale_quirks },
+	{ .compatible = "cypress,tt21000", .data = &cyttsp5_default_quirks },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, cyttsp5_of_match);
